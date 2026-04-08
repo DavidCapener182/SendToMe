@@ -2,11 +2,11 @@
   <rect width="512" height="512" rx="112" fill="#FFFFFF"/>
   <rect x="24" y="24" width="464" height="464" rx="96" stroke="#D8E4F7" stroke-width="2"/>
 
-  <g transform="translate(74 104)">
+  <g transform="translate(86 66)">
     <path d="M308 22L138 186M308 22L200 306L142 204L42 154L308 22Z"
       stroke="#5EA6FF" stroke-width="20" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
   </g>
 
-  <text x="256" y="430" text-anchor="middle" fill="#3B82F6"
+  <text x="256" y="454" text-anchor="middle" fill="#3B82F6"
     font-family="Segoe UI, Arial, sans-serif" font-size="96" font-weight="700" letter-spacing="8">STM</text>
 </svg>
