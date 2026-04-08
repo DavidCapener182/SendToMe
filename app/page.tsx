@@ -735,25 +735,40 @@ function AppContent() {
 
   useEffect(() => {
     if (!user) return;
-    const channel = supabase
+    const inboxChannel = supabase
       .channel(`stm-inbox-realtime-${user.id}`)
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'stm_inbox_items', filter: `user_id=eq.${user.id}` },
+        { event: '*', schema: 'public', table: 'stm_inbox_items', filter: `user_id=eq.${user.id}` },
         async (payload: any) => {
-          const text = payload?.new?.content || payload?.new?.url || payload?.new?.file_name;
-          if (text) await triggerCopyNotification(text);
-          await loadInbox(user);
+          if (payload?.eventType === 'INSERT') {
+            const text = payload?.new?.content || payload?.new?.url || payload?.new?.file_name;
+            if (text) await triggerCopyNotification(text);
+          }
+          await syncInboxAndNotify(user);
+        }
+      )
+      .subscribe();
+
+    const historyChannel = supabase
+      .channel(`stm-history-realtime-${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'stm_clipboard_history', filter: `user_id=eq.${user.id}` },
+        async () => {
+          await loadClipboardHistory(user);
         }
       )
       .subscribe();
 
     const interval = window.setInterval(() => {
       syncInboxAndNotify(user);
+      loadClipboardHistory(user);
     }, 10000);
 
     return () => {
-      supabase.removeChannel(channel);
+      supabase.removeChannel(inboxChannel);
+      supabase.removeChannel(historyChannel);
       window.clearInterval(interval);
     };
   }, [user]);
