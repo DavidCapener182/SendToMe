@@ -5,7 +5,18 @@ import { createClient, type User } from '@supabase/supabase-js';
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://wngqphzpxhderwfjjzla.supabase.co';
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InduZ3FwaHpweGhkZXJ3ZmpqemxhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDkxMjA1MjEsImV4cCI6MjA2NDY5NjUyMX0.mR5kB3wAYUXkwP17wjU-DXidL2E8cReVHvrNh8IWnRU';
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// PWA/webview environments can throw lock-stolen AbortErrors with navigator.locks.
+// Use a simple in-process lock executor to avoid those runtime crashes.
+const noOpAuthLock = async (_name: string, _acquireTimeout: number, fn: () => Promise<any>) => fn();
+const globalForSupabase = globalThis as unknown as { __stmSupabase?: ReturnType<typeof createClient> };
+const supabaseClient = globalForSupabase.__stmSupabase ?? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: {
+    lock: noOpAuthLock,
+  },
+});
+if (!globalForSupabase.__stmSupabase) globalForSupabase.__stmSupabase = supabaseClient;
+const supabase: any = supabaseClient;
 
 // ==========================================
 // 0. SAFE STORAGE & CLIPBOARD HELPERS
@@ -200,13 +211,14 @@ p, h1, h2, h3, div, span, a { overflow-wrap: break-word; word-wrap: break-word; 
   touch-action: pan-y;
   background: transparent;
 }
-.history-item.swiped { transform: translateX(-84px); }
+.history-item.swiped { transform: translateX(-112px); }
 .history-delete {
   position: absolute;
   right: 0;
   top: 0;
   bottom: 0;
-  width: 84px;
+  width: 112px;
+  z-index: 5;
   border: 0;
   background: var(--danger);
   color: #fff;
@@ -470,6 +482,8 @@ function AppContent() {
   const [clipboardHistory, setClipboardHistory] = useState<ClipboardHistoryItem[]>([]);
   const [swipedHistoryId, setSwipedHistoryId] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [notifyEnabled, setNotifyEnabled] = useState(false);
+  const [quickCopyPrompt, setQuickCopyPrompt] = useState<{ id: string; text: string } | null>(null);
   const touchStartXRef = useRef<number | null>(null);
   const touchDeltaXRef = useRef(0);
 
@@ -484,6 +498,39 @@ function AppContent() {
 
   const showToast = (msg: string) => setToast({ id: Date.now(), msg });
   const clearToastLater = (id: number) => setTimeout(() => setToast((current) => current?.id === id ? null : current), 3000);
+  const showTimedToast = (msg: string) => {
+    const id = Date.now();
+    setToast({ id, msg });
+    clearToastLater(id);
+  };
+  const getActiveUser = async () => {
+    if (user) return user;
+    const { data } = await supabase.auth.getSession();
+    return data.session?.user ?? null;
+  };
+  const requestNotificationPermission = async () => {
+    if (typeof Notification === 'undefined') { showTimedToast('Notifications not supported'); return; }
+    const result = await Notification.requestPermission();
+    setNotifyEnabled(result === 'granted');
+    showTimedToast(result === 'granted' ? 'Notifications enabled' : 'Notifications blocked');
+  };
+
+  const triggerCopyNotification = async (text: string) => {
+    if (typeof window === 'undefined' || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    try {
+      const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      safeSetStorage(`stm-notify-${id}`, text);
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (!reg) return;
+      await reg.showNotification('Send to Me', {
+        body: `Tap to copy: ${text.substring(0, 80)}`,
+        tag: `stm-copy-${id}`,
+        data: { url: `/?copyItem=${id}` },
+      });
+    } catch {
+      // Ignore notification failures in restricted webviews.
+    }
+  };
 
   async function hydrateRows(rows: any[]): Promise<InboxItem[]> {
     return Promise.all(rows.map(async (row) => {
@@ -528,16 +575,81 @@ function AppContent() {
       .order('copied_at', { ascending: false })
       .limit(20);
     if (error) { showToast(`History load failed: ${error.message}`); return; }
-    setClipboardHistory((data || []).map((row) => ({
+    const rows = (data || []) as any[];
+    const mapped = rows.map((row) => ({
       id: row.id,
       type: row.type,
       content: row.content,
       snippet: row.snippet,
       copied_at: new Date(row.copied_at).getTime(),
-    })));
+    }));
+    setClipboardHistory((prev) => {
+      // Keep optimistic/local history visible if cloud currently has no rows.
+      if (mapped.length === 0 && prev.length > 0) return prev;
+      return mapped;
+    });
   }
 
+  const addHistoryEntry = async (text: string, type: 'text' | 'image') => {
+    if (!text) return;
+    const snippet = type === 'image' ? 'Image URL' : text.substring(0, 80);
+
+    // Always update local UI immediately.
+    setClipboardHistory((prev) => {
+      if (prev.length > 0 && prev[0].content === text) return prev;
+      return [{
+        id: `local-${Math.random().toString(36).substring(2)}`,
+        type,
+        content: text,
+        snippet,
+        copied_at: Date.now(),
+      }, ...prev].slice(0, 20);
+    });
+    await triggerCopyNotification(text);
+
+    const activeUser = await getActiveUser();
+    if (!activeUser) return;
+
+    const { error: insertError } = await supabase.from('stm_clipboard_history').insert({
+      user_id: activeUser.id,
+      type,
+      content: text,
+      snippet,
+      copied_at: new Date().toISOString(),
+    });
+    if (insertError) {
+      showTimedToast(`History sync failed: ${insertError.message}`);
+      return;
+    }
+
+    const { data: rows, error: rowsError } = await supabase
+      .from('stm_clipboard_history')
+      .select('id')
+      .eq('user_id', activeUser.id)
+      .order('copied_at', { ascending: false });
+    if (rowsError) return;
+    const oldIds = (rows || []).slice(20).map((r: any) => r.id);
+    if (oldIds.length > 0) await supabase.from('stm_clipboard_history').delete().in('id', oldIds);
+    await loadClipboardHistory(activeUser);
+  };
+
   useEffect(() => {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+    if (typeof Notification !== 'undefined') {
+      setNotifyEnabled(Notification.permission === 'granted');
+    }
+    const params = new URLSearchParams(window.location.search);
+    const copyItem = params.get('copyItem');
+    if (copyItem) {
+      const text = safeGetStorage(`stm-notify-${copyItem}`);
+      if (text) setQuickCopyPrompt({ id: copyItem, text });
+      params.delete('copyItem');
+      const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}`;
+      window.history.replaceState({}, '', nextUrl);
+    }
+
     let mounted = true;
     (async () => {
       const { data } = await supabase.auth.getSession();
@@ -548,7 +660,7 @@ function AppContent() {
       }
       setAuthLoading(false);
     })();
-    const { data: authSub } = supabase.auth.onAuthStateChange(async (_event, session) => {
+    const { data: authSub } = supabase.auth.onAuthStateChange(async (_event: any, session: any) => {
       setUser(session?.user || null);
       if (session?.user) {
         await Promise.all([loadInbox(session.user), loadClipboardHistory(session.user)]);
@@ -560,23 +672,48 @@ function AppContent() {
     return () => { mounted = false; authSub.subscription.unsubscribe(); };
   }, []);
 
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel(`stm-inbox-realtime-${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'stm_inbox_items', filter: `user_id=eq.${user.id}` },
+        async (payload: any) => {
+          const text = payload?.new?.content || payload?.new?.url || payload?.new?.file_name;
+          if (text) await triggerCopyNotification(text);
+          await loadInbox(user);
+        }
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user]);
+
   const addItem = async (p: AddItemPayload) => {
-    if (!user) {
-      const tempUrl = p.file ? URL.createObjectURL(p.file) : null;
-      setItems((prev) => [{
-        id: Math.random().toString(36).substring(2),
-        type: p.type,
-        title: p.title || null,
-        content: p.content || null,
-        url: p.url || null,
-        file_path: tempUrl,
-        file_name: p.file_name || null,
-        device_name: p.device_name || deviceName,
-        is_pinned: false,
-        is_archived: false,
-        created_at: new Date().toISOString(),
-        preview_url: tempUrl,
-      }, ...prev]);
+    const tempUrl = p.file ? URL.createObjectURL(p.file) : null;
+    const optimisticItem: InboxItem = {
+      id: `local-${Math.random().toString(36).substring(2)}`,
+      type: p.type,
+      title: p.title || null,
+      content: p.content || null,
+      url: p.url || null,
+      file_path: tempUrl,
+      file_name: p.file_name || null,
+      device_name: p.device_name || deviceName,
+      is_pinned: false,
+      is_archived: false,
+      created_at: new Date().toISOString(),
+      preview_url: tempUrl,
+    };
+    setItems((prev) => [optimisticItem, ...prev]);
+    const historyText = p.content || p.url || p.file_name || null;
+    if (historyText) await addHistoryEntry(historyText, 'text');
+    else if (p.type === 'image' && tempUrl) await addHistoryEntry(tempUrl, 'image');
+
+    const activeUser = await getActiveUser();
+    if (!activeUser) {
       return;
     }
     let storagePath: string | null = null;
@@ -584,12 +721,12 @@ function AppContent() {
     if (p.file) {
       const fileExt = finalFileName?.split('.').pop() || (p.type === 'audio' ? 'webm' : 'bin');
       finalFileName = finalFileName || `${Date.now()}.${fileExt}`;
-      storagePath = `${user.id}/${Date.now()}-${Math.random().toString(36).slice(2)}-${finalFileName}`;
+      storagePath = `${activeUser.id}/${Date.now()}-${Math.random().toString(36).slice(2)}-${finalFileName}`;
       const { error: uploadError } = await supabase.storage.from('stm-files').upload(storagePath, p.file, { upsert: false });
-      if (uploadError) { showToast(`Upload failed: ${uploadError.message}`); return; }
+      if (uploadError) { showTimedToast(`Saved locally. Upload sync failed: ${uploadError.message}`); return; }
     }
     const payload = {
-      user_id: user.id,
+      user_id: activeUser.id,
       type: p.type,
       title: p.title || null,
       content: p.content || null,
@@ -601,37 +738,13 @@ function AppContent() {
       is_archived: false,
     };
     const { error } = await supabase.from('stm_inbox_items').insert(payload);
-    if (error) { showToast(`Save failed: ${error.message}`); return; }
-    await loadInbox(user);
+    if (error) { showTimedToast(`Saved locally. Cloud sync failed: ${error.message}`); return; }
+    await loadInbox(activeUser);
   };
 
   const handleCopy = async (text: string, type: 'text'|'image', isReCopy = false) => {
     await copyToClipboard(text);
-    if (!user && !isReCopy) {
-      setClipboardHistory((prev) => {
-        if (prev.length > 0 && prev[0].content === text) return prev;
-        return [{
-          id: Math.random().toString(36).substring(2),
-          type,
-          content: text,
-          snippet: type === 'image' ? 'Image URL' : text.substring(0, 80),
-          copied_at: Date.now(),
-        }, ...prev].slice(0, 20);
-      });
-    } else if (user && !isReCopy) {
-      const snippet = type === 'image' ? 'Image URL' : text.substring(0, 80);
-      await supabase.from('stm_clipboard_history').insert({
-        user_id: user.id,
-        type,
-        content: text,
-        snippet,
-        copied_at: new Date().toISOString(),
-      });
-      const { data: rows } = await supabase.from('stm_clipboard_history').select('id').eq('user_id', user.id).order('copied_at', { ascending: false });
-      const oldIds = (rows || []).slice(20).map((r: any) => r.id);
-      if (oldIds.length > 0) await supabase.from('stm_clipboard_history').delete().in('id', oldIds);
-      await loadClipboardHistory(user);
-    }
+    if (!isReCopy) await addHistoryEntry(text, type);
     const id = Date.now();
     setToast({ id, msg: type === 'image' ? 'Image URL copied!' : 'Copied!' });
     clearToastLater(id);
@@ -684,9 +797,9 @@ function AppContent() {
                   <button
                     className="btn secondary small"
                     onClick={async () => {
-                      if (!authEmail.trim() || !authPassword.trim()) { showToast('Enter email and password'); return; }
+                      if (!authEmail.trim() || !authPassword.trim()) { showTimedToast('Enter email and password'); return; }
                       const { error } = await supabase.auth.signInWithPassword({ email: authEmail.trim(), password: authPassword });
-                      showToast(error ? error.message : 'Signed in');
+                      showTimedToast(error ? error.message : 'Signed in');
                     }}
                   >
                     Sign In
@@ -700,6 +813,7 @@ function AppContent() {
                 </>
               )}
               <button className="btn secondary" onClick={() => setIsModalOpen(true)} style={{ padding: '8px 12px' }}><Icons.Clipboard /> <span style={{fontSize: 14}}>History {clipboardHistory.length > 0 && `(${clipboardHistory.length})`}</span></button>
+              {!notifyEnabled && <button className="btn secondary small" onClick={requestNotificationPermission}>Enable Alerts</button>}
               <button className="btn secondary icon-only" onClick={toggleTheme} style={{ borderRadius: '50%' }}>{theme === 'dark' ? <Icons.Sun /> : <Icons.Moon />}</button>
             </div>
           </div>
@@ -872,7 +986,11 @@ function AppContent() {
                       if (touchDeltaXRef.current > 20 && swipedHistoryId === item.id) setSwipedHistoryId(null);
                     }}
                     onTouchEnd={() => {
-                      if (touchDeltaXRef.current > -30) setSwipedHistoryId(null);
+                      if (touchDeltaXRef.current <= -90) {
+                        deleteHistoryItem(item.id);
+                      } else if (touchDeltaXRef.current > -30) {
+                        setSwipedHistoryId(null);
+                      }
                       touchStartXRef.current = null;
                       touchDeltaXRef.current = 0;
                     }}
@@ -881,12 +999,54 @@ function AppContent() {
                       <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>{item.type === 'image' ? <Icons.Image /> : <Icons.Note />} {new Date(item.copied_at).toLocaleTimeString()}</div>
                       <div style={{ color: 'var(--text)', fontSize: 15, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{item.snippet}</div>
                     </div>
-                    <button className="btn small secondary" style={{ flexShrink: 0 }}><Icons.Copy /> Re-Copy</button>
+                    {swipedHistoryId !== item.id && (
+                      <div className="row" style={{ gap: 8, flexShrink: 0 }}>
+                        <button
+                          className="btn small secondary"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleCopy(item.content, item.type, true);
+                          }}
+                        >
+                          <Icons.Copy /> Re-Copy
+                        </button>
+                        <button
+                          className="btn small danger"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteHistoryItem(item.id);
+                          }}
+                        >
+                          <Icons.Trash /> Delete
+                        </button>
+                      </div>
+                    )}
                   </div>
                   <button className="history-delete" onClick={() => deleteHistoryItem(item.id)}>Delete</button>
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      )}
+      {quickCopyPrompt && (
+        <div style={{ position: 'fixed', left: 16, right: 16, bottom: 16, zIndex: 1200 }}>
+          <div className="card" style={{ padding: 14, background: 'var(--panel-solid)' }}>
+            <div className="space-between" style={{ marginBottom: 8 }}>
+              <strong>Ready to copy</strong>
+              <button className="btn secondary small" onClick={() => setQuickCopyPrompt(null)}>Dismiss</button>
+            </div>
+            <div className="muted" style={{ marginBottom: 10, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{quickCopyPrompt.text}</div>
+            <button
+              className="btn"
+              onClick={async () => {
+                await handleCopy(quickCopyPrompt.text, 'text', true);
+                safeSetStorage(`stm-notify-${quickCopyPrompt.id}`, '');
+                setQuickCopyPrompt(null);
+              }}
+            >
+              <Icons.Copy /> Copy Now
+            </button>
           </div>
         </div>
       )}
