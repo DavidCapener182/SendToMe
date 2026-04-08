@@ -305,7 +305,7 @@ function useTheme() {
 // ==========================================
 // 6. COMPONENTS
 // ==========================================
-function Composer({ deviceName, onAddItem, onTriggerPaste, disabled }: { deviceName: string; onAddItem: (payload: AddItemPayload) => Promise<void>; onTriggerPaste: () => Promise<void>; disabled: boolean; }) {
+function Composer({ deviceName, onAddItem, onTriggerPaste }: { deviceName: string; onAddItem: (payload: AddItemPayload) => Promise<void>; onTriggerPaste: () => Promise<void>; }) {
   const [type, setType] = useState<ItemType>('note');
   const [title, setTitle] = useState('');
   const [content, setContent] = useState('');
@@ -410,25 +410,25 @@ function Composer({ deviceName, onAddItem, onTriggerPaste, disabled }: { deviceN
     >
       <div className="space-between" style={{ marginBottom: 20 }}>
         <div><h2 style={{ margin: 0, fontSize: '20px' }}>Quick Capture</h2></div>
-        <button className="btn secondary small" onClick={onTriggerPaste} disabled={disabled}><Icons.Copy /> Paste OS</button>
+        <button className="btn secondary small" onClick={onTriggerPaste}><Icons.Copy /> Paste OS</button>
       </div>
 
       <form className="grid" onSubmit={saveItem}>
         <div className="segment-group">
           {([{t:'note',i:<Icons.Note/>}, {t:'link',i:<Icons.Link/>}, {t:'file',i:<Icons.File/>}, {t:'image',i:<Icons.Image/>}, {t:'audio',i:<Icons.Mic/>} ] as const).map(({t, i}) => (
-            <button key={t} type="button" className={`segment-btn ${type === t ? 'active' : ''}`} onClick={() => setType(t as ItemType)} disabled={disabled}>
+            <button key={t} type="button" className={`segment-btn ${type === t ? 'active' : ''}`} onClick={() => setType(t as ItemType)}>
               {i} <span style={{ textTransform: 'capitalize' }}>{t}</span>
             </button>
           ))}
         </div>
 
-        <input className="input" placeholder={type==='audio'?"Memo Title (optional)":"Title (optional)"} value={title} onChange={(e) => setTitle(e.target.value)} onKeyDown={handleKeyDown} disabled={disabled} />
+        <input className="input" placeholder={type==='audio'?"Memo Title (optional)":"Title (optional)"} value={title} onChange={(e) => setTitle(e.target.value)} onKeyDown={handleKeyDown} />
 
-        {['note', 'link'].includes(type) && <textarea className="textarea" placeholder={type === 'note' ? 'Write a note...\n(Pro tip: Ctrl+Enter to save)' : 'Add context...\n(Pro tip: Ctrl+Enter to save)'} value={content} onChange={(e) => setContent(e.target.value)} onKeyDown={handleKeyDown} disabled={disabled} />}
-        {type === 'link' && <input className="input" placeholder="https://example.com" value={url} onChange={(e) => setUrl(e.target.value)} required onKeyDown={handleKeyDown} disabled={disabled} />}
+        {['note', 'link'].includes(type) && <textarea className="textarea" placeholder={type === 'note' ? 'Write a note...\n(Pro tip: Ctrl+Enter to save)' : 'Add context...\n(Pro tip: Ctrl+Enter to save)'} value={content} onChange={(e) => setContent(e.target.value)} onKeyDown={handleKeyDown} />}
+        {type === 'link' && <input className="input" placeholder="https://example.com" value={url} onChange={(e) => setUrl(e.target.value)} required onKeyDown={handleKeyDown} />}
         {['file', 'image'].includes(type) && (
           <div style={{ position: 'relative' }}>
-             <input ref={fileRef} className="input" type="file" accept={type === 'image' ? 'image/*' : undefined} onChange={uploadFile} style={{ padding: '24px 16px', background: 'var(--panel)' }} disabled={disabled} />
+             <input ref={fileRef} className="input" type="file" accept={type === 'image' ? 'image/*' : undefined} onChange={uploadFile} style={{ padding: '24px 16px', background: 'var(--panel)' }} />
              <div className="muted" style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', pointerEvents: 'none', background: 'var(--panel-solid)', padding: '4px 12px', borderRadius: 8 }}>
                Or drag & drop here
              </div>
@@ -441,15 +441,15 @@ function Composer({ deviceName, onAddItem, onTriggerPaste, disabled }: { deviceN
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
                 <div style={{ width: 16, height: 16, borderRadius: '50%', background: 'var(--danger)' }} className="anim-pulse" />
                 <span style={{ color: 'var(--danger)', fontWeight: 600 }}>Recording...</span>
-                <button type="button" className="btn danger" onClick={toggleRecording} disabled={disabled}><Icons.Square /> Stop & Save</button>
+                <button type="button" className="btn danger" onClick={toggleRecording}><Icons.Square /> Stop & Save</button>
               </div>
             ) : (
-              <button type="button" className="btn secondary" onClick={toggleRecording} disabled={disabled}><Icons.Mic /> Start Recording</button>
+              <button type="button" className="btn secondary" onClick={toggleRecording}><Icons.Mic /> Start Recording</button>
             )}
           </div>
         )}
 
-        {['note', 'link'].includes(type) && <button className="btn" type="submit" disabled={disabled}>{uploading ? 'Uploading...' : `Save ${type}`}</button>}
+        {['note', 'link'].includes(type) && <button className="btn" type="submit">{uploading ? 'Uploading...' : `Save ${type}`}</button>}
       </form>
     </div>
   );
@@ -462,7 +462,8 @@ function AppContent() {
   const { theme, toggleTheme } = useTheme();
   const [deviceName] = useState('This Device');
   const [user, setUser] = useState<User | null>(null);
-  const [authEmail, setAuthEmail] = useState('capener182@googlemail.com');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
   const [authLoading, setAuthLoading] = useState(true);
   const [items, setItems] = useState<InboxItem[]>([]);
   const [toast, setToast] = useState<{id: number, msg: string} | null>(null);
@@ -560,7 +561,24 @@ function AppContent() {
   }, []);
 
   const addItem = async (p: AddItemPayload) => {
-    if (!user) { showToast('Sign in to save items'); return; }
+    if (!user) {
+      const tempUrl = p.file ? URL.createObjectURL(p.file) : null;
+      setItems((prev) => [{
+        id: Math.random().toString(36).substring(2),
+        type: p.type,
+        title: p.title || null,
+        content: p.content || null,
+        url: p.url || null,
+        file_path: tempUrl,
+        file_name: p.file_name || null,
+        device_name: p.device_name || deviceName,
+        is_pinned: false,
+        is_archived: false,
+        created_at: new Date().toISOString(),
+        preview_url: tempUrl,
+      }, ...prev]);
+      return;
+    }
     let storagePath: string | null = null;
     let finalFileName = p.file_name || null;
     if (p.file) {
@@ -589,7 +607,18 @@ function AppContent() {
 
   const handleCopy = async (text: string, type: 'text'|'image', isReCopy = false) => {
     await copyToClipboard(text);
-    if (user && !isReCopy) {
+    if (!user && !isReCopy) {
+      setClipboardHistory((prev) => {
+        if (prev.length > 0 && prev[0].content === text) return prev;
+        return [{
+          id: Math.random().toString(36).substring(2),
+          type,
+          content: text,
+          snippet: type === 'image' ? 'Image URL' : text.substring(0, 80),
+          copied_at: Date.now(),
+        }, ...prev].slice(0, 20);
+      });
+    } else if (user && !isReCopy) {
       const snippet = type === 'image' ? 'Image URL' : text.substring(0, 80);
       await supabase.from('stm_clipboard_history').insert({
         user_id: user.id,
@@ -649,19 +678,27 @@ function AppContent() {
             <div className="row">
               {!user && !authLoading && (
                 <>
-                  <input className="input" style={{ width: 240, padding: '8px 10px' }} value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="email" />
+                  <span className="badge muted" style={{ background: 'transparent', border: '1px solid var(--border)', padding: '8px 10px' }}>Not signed in</span>
+                  <input className="input" style={{ width: 220, padding: '8px 10px' }} value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="Email" />
+                  <input className="input" style={{ width: 180, padding: '8px 10px' }} type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="Password" />
                   <button
                     className="btn secondary small"
                     onClick={async () => {
-                      const { error } = await supabase.auth.signInWithOtp({ email: authEmail, options: { emailRedirectTo: window.location.origin } });
-                      showToast(error ? error.message : 'Magic link sent');
+                      if (!authEmail.trim() || !authPassword.trim()) { showToast('Enter email and password'); return; }
+                      const { error } = await supabase.auth.signInWithPassword({ email: authEmail.trim(), password: authPassword });
+                      showToast(error ? error.message : 'Signed in');
                     }}
                   >
                     Sign In
                   </button>
                 </>
               )}
-              {user && <button className="btn secondary small" onClick={async () => { await supabase.auth.signOut(); }}>Sign Out</button>}
+              {user && (
+                <>
+                  <span className="badge muted" style={{ background: 'transparent', border: '1px solid var(--border)', padding: '8px 10px' }}>{user.email}</span>
+                  <button className="btn secondary small" onClick={async () => { await supabase.auth.signOut(); }}>Sign Out</button>
+                </>
+              )}
               <button className="btn secondary" onClick={() => setIsModalOpen(true)} style={{ padding: '8px 12px' }}><Icons.Clipboard /> <span style={{fontSize: 14}}>History {clipboardHistory.length > 0 && `(${clipboardHistory.length})`}</span></button>
               <button className="btn secondary icon-only" onClick={toggleTheme} style={{ borderRadius: '50%' }}>{theme === 'dark' ? <Icons.Sun /> : <Icons.Moon />}</button>
             </div>
@@ -673,8 +710,7 @@ function AppContent() {
 
             {/* LEFT COLUMN: Composer */}
             <div style={{ position: 'sticky', top: 88, height: 'max-content' }}>
-              <Composer deviceName={deviceName} disabled={!user} onAddItem={addItem} onTriggerPaste={async () => {
-                if (!user) { showToast('Sign in to use clipboard sync'); return; }
+              <Composer deviceName={deviceName} onAddItem={addItem} onTriggerPaste={async () => {
                 try {
                   const text = await navigator.clipboard.readText(); const t = /^https?:\/\//i.test(text) ? 'link' : 'note';
                   await addItem({ type: t, content: text, url: t === 'link' ? text : null, device_name: deviceName }); showToast('Pasted to Inbox!');
