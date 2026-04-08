@@ -486,6 +486,7 @@ function AppContent() {
   const [quickCopyPrompt, setQuickCopyPrompt] = useState<{ id: string; text: string } | null>(null);
   const touchStartXRef = useRef<number | null>(null);
   const touchDeltaXRef = useRef(0);
+  const seenInboxIdsRef = useRef<Set<string>>(new Set());
 
   // Search & Filters
   const [searchQuery, setSearchQuery] = useState('');
@@ -602,6 +603,26 @@ function AppContent() {
     if (error) { showToast(`Inbox load failed: ${error.message}`); return; }
     const mapped = await hydrateRows(data || []);
     setItems(mapped);
+    seenInboxIdsRef.current = new Set(mapped.map((item) => item.id));
+  }
+
+  async function syncInboxAndNotify(currentUser: User) {
+    const { data, error } = await supabase
+      .from('stm_inbox_items')
+      .select('*')
+      .eq('user_id', currentUser.id)
+      .order('created_at', { ascending: false });
+    if (error) return;
+    const mapped = await hydrateRows(data || []);
+    const newItems = mapped.filter((item) => !seenInboxIdsRef.current.has(item.id));
+    if (newItems.length > 0) {
+      for (const item of newItems.slice(0, 3)) {
+        const text = item.content || item.url || item.file_name || item.title || 'New item';
+        await triggerCopyNotification(text);
+      }
+    }
+    setItems(mapped);
+    seenInboxIdsRef.current = new Set(mapped.map((item) => item.id));
   }
 
   async function loadClipboardHistory(currentUser: User) {
@@ -726,8 +747,14 @@ function AppContent() {
         }
       )
       .subscribe();
+
+    const interval = window.setInterval(() => {
+      syncInboxAndNotify(user);
+    }, 10000);
+
     return () => {
       supabase.removeChannel(channel);
+      window.clearInterval(interval);
     };
   }, [user]);
 
