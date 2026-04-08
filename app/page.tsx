@@ -508,6 +508,43 @@ function AppContent() {
     const { data } = await supabase.auth.getSession();
     return data.session?.user ?? null;
   };
+  const getItemHistoryCandidates = (item: Partial<InboxItem>) => {
+    return [item.content, item.url, item.file_name].filter(Boolean) as string[];
+  };
+  const removeHistoryEntriesByValues = async (values: string[]) => {
+    const uniqueValues = Array.from(new Set(values.filter(Boolean)));
+    if (uniqueValues.length === 0) return;
+    const activeUser = await getActiveUser();
+
+    // Always update local state immediately.
+    setClipboardHistory((prev) => prev.filter((h) => !uniqueValues.includes(h.content)));
+
+    if (!activeUser) return;
+    for (const value of uniqueValues) {
+      await supabase.from('stm_clipboard_history').delete().eq('user_id', activeUser.id).eq('content', value);
+    }
+    await loadClipboardHistory(activeUser);
+  };
+  const removeInboxEntriesByHistoryValues = async (values: string[]) => {
+    const uniqueValues = Array.from(new Set(values.filter(Boolean)));
+    if (uniqueValues.length === 0) return;
+    const activeUser = await getActiveUser();
+
+    setItems((prev) =>
+      prev.filter((item) => {
+        const candidates = getItemHistoryCandidates(item);
+        return !candidates.some((candidate) => uniqueValues.includes(candidate));
+      })
+    );
+
+    if (!activeUser) return;
+    for (const value of uniqueValues) {
+      await supabase.from('stm_inbox_items').delete().eq('user_id', activeUser.id).eq('content', value);
+      await supabase.from('stm_inbox_items').delete().eq('user_id', activeUser.id).eq('url', value);
+      await supabase.from('stm_inbox_items').delete().eq('user_id', activeUser.id).eq('file_name', value);
+    }
+    await loadInbox(activeUser);
+  };
   const requestNotificationPermission = async () => {
     if (typeof Notification === 'undefined') { showTimedToast('Notifications not supported'); return; }
     const result = await Notification.requestPermission();
@@ -624,12 +661,15 @@ function AppContent() {
 
     const { data: rows, error: rowsError } = await supabase
       .from('stm_clipboard_history')
-      .select('id')
+      .select('id,content')
       .eq('user_id', activeUser.id)
       .order('copied_at', { ascending: false });
     if (rowsError) return;
-    const oldIds = (rows || []).slice(20).map((r: any) => r.id);
+    const staleRows = (rows || []).slice(20) as any[];
+    const oldIds = staleRows.map((r: any) => r.id);
+    const staleValues = staleRows.map((r: any) => r.content).filter(Boolean);
     if (oldIds.length > 0) await supabase.from('stm_clipboard_history').delete().in('id', oldIds);
+    if (staleValues.length > 0) await removeInboxEntriesByHistoryValues(staleValues);
     await loadClipboardHistory(activeUser);
   };
 
@@ -941,11 +981,13 @@ function AppContent() {
                         <button className="btn secondary icon-only" onClick={() => updateItem(item.id, { is_archived: !item.is_archived })} title={item.is_archived ? "Unarchive" : "Archive"}><Icons.Archive /></button>
                         <button className="btn danger icon-only" onClick={async () => {
                           if (!window.confirm('Delete item forever?')) return;
+                          const historyValues = getItemHistoryCandidates(item);
                           setItems((prev) => prev.filter((i) => i.id !== item.id));
                           if (user) {
                             await supabase.from('stm_inbox_items').delete().eq('id', item.id).eq('user_id', user.id);
                             if (item.file_path) await supabase.storage.from('stm-files').remove([item.file_path]);
                           }
+                          await removeHistoryEntriesByValues(historyValues);
                         }}><Icons.Trash /></button>
                       </div>
                     </div>
