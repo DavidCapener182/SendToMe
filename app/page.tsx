@@ -17,6 +17,7 @@ const supabaseClient = globalForSupabase.__stmSupabase ?? createClient(SUPABASE_
 });
 if (!globalForSupabase.__stmSupabase) globalForSupabase.__stmSupabase = supabaseClient;
 const supabase: any = supabaseClient;
+const PENDING_SYNC_KEY = 'stm-pending-sync-items';
 
 // ==========================================
 // 0. SAFE STORAGE & CLIPBOARD HELPERS
@@ -299,6 +300,15 @@ type AddItemPayload = {
   device_name?: string | null;
   file?: File | Blob | null;
 };
+type PendingSyncItem = {
+  type: ItemType;
+  title: string | null;
+  content: string | null;
+  url: string | null;
+  file_name: string | null;
+  device_name: string | null;
+  created_at: string;
+};
 
 // ==========================================
 // 5. HOOKS
@@ -482,6 +492,7 @@ function AppContent() {
   const [clipboardHistory, setClipboardHistory] = useState<ClipboardHistoryItem[]>([]);
   const [swipedHistoryId, setSwipedHistoryId] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [pendingSyncCount, setPendingSyncCount] = useState(0);
   const [notifyEnabled, setNotifyEnabled] = useState(false);
   const [quickCopyPrompt, setQuickCopyPrompt] = useState<{ id: string; text: string } | null>(null);
   const touchStartXRef = useRef<number | null>(null);
@@ -508,6 +519,55 @@ function AppContent() {
     if (user) return user;
     const { data } = await supabase.auth.getSession();
     return data.session?.user ?? null;
+  };
+  const getPendingSyncItems = (): PendingSyncItem[] => {
+    try {
+      const raw = window.localStorage.getItem(PENDING_SYNC_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  const setPendingSyncItems = (items: PendingSyncItem[]) => {
+    try {
+      window.localStorage.setItem(PENDING_SYNC_KEY, JSON.stringify(items.slice(-100)));
+      setPendingSyncCount(items.length);
+    } catch {
+      // ignore storage failures
+    }
+  };
+  const queuePendingSyncItem = (item: PendingSyncItem) => {
+    const current = getPendingSyncItems();
+    current.push(item);
+    setPendingSyncItems(current);
+  };
+  const flushPendingSyncItems = async (activeUser: User) => {
+    const current = getPendingSyncItems();
+    if (current.length === 0) { setPendingSyncCount(0); return; }
+    const failed: PendingSyncItem[] = [];
+    for (const item of current) {
+      const { error } = await supabase.from('stm_inbox_items').insert({
+        user_id: activeUser.id,
+        type: item.type,
+        title: item.title,
+        content: item.content,
+        url: item.url,
+        file_path: null,
+        file_name: item.file_name,
+        device_name: item.device_name || 'This Device',
+        is_pinned: false,
+        is_archived: false,
+        created_at: item.created_at,
+      });
+      if (error) failed.push(item);
+    }
+    setPendingSyncItems(failed);
+    if (failed.length === 0) {
+      showTimedToast('Pending items synced');
+      await loadInbox(activeUser);
+    }
   };
   const getItemHistoryCandidates = (item: Partial<InboxItem>) => {
     return [item.content, item.url, item.file_name].filter(Boolean) as string[];
@@ -713,11 +773,13 @@ function AppContent() {
 
     let mounted = true;
     (async () => {
+      setPendingSyncCount(getPendingSyncItems().length);
       const { data } = await supabase.auth.getSession();
       if (!mounted) return;
       setUser(data.session?.user || null);
       if (data.session?.user) {
         await Promise.all([loadInbox(data.session.user), loadClipboardHistory(data.session.user)]);
+        await flushPendingSyncItems(data.session.user);
       }
       setAuthLoading(false);
     })();
@@ -725,6 +787,7 @@ function AppContent() {
       setUser(session?.user || null);
       if (session?.user) {
         await Promise.all([loadInbox(session.user), loadClipboardHistory(session.user)]);
+        await flushPendingSyncItems(session.user);
       } else {
         setItems([]);
         setClipboardHistory([]);
@@ -732,6 +795,23 @@ function AppContent() {
     });
     return () => { mounted = false; authSub.subscription.unsubscribe(); };
   }, []);
+
+  useEffect(() => {
+    const tryFlush = async () => {
+      const activeUser = await getActiveUser();
+      if (activeUser) await flushPendingSyncItems(activeUser);
+    };
+    const onOnline = () => { void tryFlush(); };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void tryFlush();
+    };
+    window.addEventListener('online', onOnline);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('online', onOnline);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [user]);
 
   useEffect(() => {
     if (!user) return;
@@ -764,6 +844,7 @@ function AppContent() {
     const interval = window.setInterval(() => {
       syncInboxAndNotify(user);
       loadClipboardHistory(user);
+      flushPendingSyncItems(user);
     }, 10000);
 
     return () => {
@@ -796,6 +877,16 @@ function AppContent() {
 
     const activeUser = await getActiveUser();
     if (!activeUser) {
+      queuePendingSyncItem({
+        type: p.type,
+        title: p.title || null,
+        content: p.content || null,
+        url: p.url || null,
+        file_name: p.file_name || null,
+        device_name: p.device_name || deviceName,
+        created_at: optimisticItem.created_at,
+      });
+      showTimedToast('Saved locally. Sign in on this device to sync.');
       return;
     }
     let storagePath: string | null = null;
@@ -820,7 +911,19 @@ function AppContent() {
       is_archived: false,
     };
     const { error } = await supabase.from('stm_inbox_items').insert(payload);
-    if (error) { showTimedToast(`Saved locally. Cloud sync failed: ${error.message}`); return; }
+    if (error) {
+      queuePendingSyncItem({
+        type: p.type,
+        title: p.title || null,
+        content: p.content || null,
+        url: p.url || null,
+        file_name: finalFileName || null,
+        device_name: p.device_name || deviceName,
+        created_at: optimisticItem.created_at,
+      });
+      showTimedToast(`Saved locally. Cloud sync queued: ${error.message}`);
+      return;
+    }
     await loadInbox(activeUser);
   };
 
@@ -891,6 +994,9 @@ function AppContent() {
               {user && (
                 <>
                   <span className="badge muted" style={{ background: 'transparent', border: '1px solid var(--border)', padding: '8px 10px' }}>{user.email}</span>
+                  <span className="badge" style={{ background: 'transparent', border: '1px solid var(--border)', padding: '8px 10px' }}>
+                    {pendingSyncCount > 0 ? `Sync queued (${pendingSyncCount})` : 'Synced'}
+                  </span>
                   <button className="btn secondary small" onClick={async () => { await supabase.auth.signOut(); }}>Sign Out</button>
                 </>
               )}
