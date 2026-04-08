@@ -702,8 +702,12 @@ function AppContent() {
       copied_at: new Date(row.copied_at).getTime(),
     }));
     setClipboardHistory((prev) => {
-      // Keep optimistic/local history visible if cloud currently has no rows.
-      if (mapped.length === 0 && prev.length > 0) return prev;
+      // Keep only unsynced local placeholders if cloud returns empty.
+      // This prevents stale server rows lingering across devices after deletes.
+      if (mapped.length === 0 && prev.length > 0) {
+        const localOnly = prev.filter((item) => item.id.startsWith('local-'));
+        return localOnly;
+      }
       return mapped;
     });
   }
