@@ -520,6 +520,14 @@ function AppContent() {
     const { data } = await supabase.auth.getSession();
     return data.session?.user ?? null;
   };
+  const refreshAndGetUser = async () => {
+    try {
+      await supabase.auth.refreshSession();
+    } catch {
+      // ignore refresh errors; fallback to current session read
+    }
+    return getActiveUser();
+  };
   const getPendingSyncItems = (): PendingSyncItem[] => {
     try {
       const raw = window.localStorage.getItem(PENDING_SYNC_KEY);
@@ -881,6 +889,10 @@ function AppContent() {
 
     const activeUser = await getActiveUser();
     if (!activeUser) {
+      if (p.file) {
+        showTimedToast('File saved locally only. Sign in on this device to sync files.');
+        return;
+      }
       queuePendingSyncItem({
         type: p.type,
         title: p.title || null,
@@ -899,8 +911,16 @@ function AppContent() {
       const fileExt = finalFileName?.split('.').pop() || (p.type === 'audio' ? 'webm' : 'bin');
       finalFileName = finalFileName || `${Date.now()}.${fileExt}`;
       storagePath = `${activeUser.id}/${Date.now()}-${Math.random().toString(36).slice(2)}-${finalFileName}`;
-      const { error: uploadError } = await supabase.storage.from('stm-files').upload(storagePath, p.file, { upsert: false });
-      if (uploadError) { showTimedToast(`Saved locally. Upload sync failed: ${uploadError.message}`); return; }
+      const contentType = (p.file as File)?.type || (p.type === 'audio' ? 'audio/webm' : undefined);
+      let { error: uploadError } = await supabase.storage.from('stm-files').upload(storagePath, p.file, { upsert: false, contentType });
+      if (uploadError) {
+        const refreshedUser = await refreshAndGetUser();
+        if (refreshedUser?.id === activeUser.id) {
+          const retry = await supabase.storage.from('stm-files').upload(storagePath, p.file, { upsert: false, contentType });
+          uploadError = retry.error;
+        }
+      }
+      if (uploadError) { showTimedToast(`File saved locally. Upload sync failed: ${uploadError.message}`); return; }
     }
     const payload = {
       user_id: activeUser.id,
@@ -914,7 +934,14 @@ function AppContent() {
       is_pinned: false,
       is_archived: false,
     };
-    const { error } = await supabase.from('stm_inbox_items').insert(payload);
+    let { error } = await supabase.from('stm_inbox_items').insert(payload);
+    if (error) {
+      const refreshedUser = await refreshAndGetUser();
+      if (refreshedUser?.id === activeUser.id) {
+        const retry = await supabase.from('stm_inbox_items').insert(payload);
+        error = retry.error;
+      }
+    }
     if (error) {
       queuePendingSyncItem({
         type: p.type,
